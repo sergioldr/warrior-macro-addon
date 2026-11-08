@@ -1,0 +1,5 @@
+## Interface: 16001
+## Title: WarriorMacroAddon
+## Notes: Crea y mantiene las macros de guerrero, agrupadas: P = Proteccion, C = Comun, D = DPS
+## Version: 1.2
+WarriorMacroAddon.lua
