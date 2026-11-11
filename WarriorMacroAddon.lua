@@ -21,7 +21,9 @@ local EN = {
 local VANGUARD_LEVEL = 25
 
 local fallback = {}   -- hechizos sin traduccion en este cliente (se avisa al final)
+local nameCache = {}  -- nombres ya resueltos en esta pasada (se vacia al empezar cada una)
 local function N(key)
+  if nameCache[key] then return nameCache[key] end
   local ids, name = S[key], nil
   if not ids then return "{"..key.."}" end
   if type(ids) ~= "table" then ids = {ids} end
@@ -31,7 +33,8 @@ local function N(key)
     if name then break end
   end
   if not name then fallback[key] = true end
-  return name or EN[key]
+  nameCache[key] = name or EN[key]
+  return nameCache[key]
 end
 local function ShieldType()
   local n
@@ -39,8 +42,8 @@ local function ShieldType()
   if not n and GetItemSubClassInfo then n = GetItemSubClassInfo(4, 6) end
   return n or "Shields"
 end
-local function F(body)
-  body = body:gsub("{SHIELDTYPE}", ShieldType())
+local function F(body, shield)
+  body = body:gsub("{SHIELDTYPE}", shield)
   return (body:gsub("{(%u+)}", N))
 end
 -- Barra 5 de Bartender4 (vertical izquierda): boton 1 = BT4Button49 (2 manos), 2 = BT4Button50 (1 mano), 3 = BT4Button51 (escudo)
@@ -107,79 +110,154 @@ local REMOVE = {
   "G Intercept",    -- = Opener (nivel 30+ lanza Intercept sin salir de Defensive)
 }
 
--- Compara sin tener en cuenta espacios/saltos de linea al final
+-- Compara ignorando \r, espacios al final de cada linea y saltos de linea finales
+local function norm(s)
+  s = (s or ""):gsub("\r", ""):gsub("[ \t]+\n", "\n"):gsub("%s+$", "")
+  return s
+end
 local function same(a, b)
-  return (a or ""):gsub("%s+$", "") == (b or ""):gsub("%s+$", "")
+  return norm(a) == norm(b)
 end
 
--- verbose = true cuando lo lanzas a mano con /warriormacros: entonces informa aunque no cambie nada
-local function Create(verbose)
-  if InCombatLockdown() then return false end
+local PREFIX = "|cffc79c6eWarriorMacroAddon|r: "
+
+-- Pasada de SOLO LECTURA: calcula que hay que cambiar sin tocar ninguna macro.
+local function Plan(verbose)
   wipe(fallback)
-  local made, updated, renamed, skipped, removed = 0, 0, 0, 0, 0
+  wipe(nameCache)
+  local shield = ShieldType()   -- una vez por pasada
+  local ops = {}
   for _, name in ipairs(REMOVE) do
-    local idx = GetMacroIndexByName(name)
-    if idx ~= 0 and pcall(DeleteMacro, idx) then removed = removed + 1 end
+    if GetMacroIndexByName(name) ~= 0 then ops[#ops+1] = {kind="remove", name=name} end
   end
   -- Solo se toca una macro si falta, tiene nombre antiguo o su contenido es distinto al de este archivo.
   for _, m in ipairs(MACROS) do
     local name = m[1]:sub(1, 16)
     local raw = type(m[2]) == "function" and m[2]() or m[2]
-    local body = F(raw)
+    local body = F(raw, shield)
+    local icon = m.icon or 134400
     local idx = GetMacroIndexByName(name)
-    local oldIdx = (idx == 0 and m.old) and GetMacroIndexByName(m.old) or 0
     if idx ~= 0 then
       local _, _, curBody = GetMacroInfo(idx)
-      if not same(curBody, body) and pcall(EditMacro, idx, name, m.icon or 134400, body) then updated = updated + 1 end
-    elseif oldIdx ~= 0 then
-      -- Renombrar conserva la macro en las barras de accion
-      if pcall(EditMacro, oldIdx, name, m.icon or 134400, body) then renamed = renamed + 1 end
+      if not same(curBody, body) then
+        ops[#ops+1] = {kind="edit", name=name, icon=icon, body=body}
+        if verbose then print(PREFIX.."se actualizara '"..name.."'") end
+      end
+    elseif m.old and GetMacroIndexByName(m.old) ~= 0 then
+      ops[#ops+1] = {kind="rename", old=m.old, name=name, icon=icon, body=body}
     else
-      local ok = pcall(CreateMacro, name, m.icon or 134400, body, true)   -- true = macro del personaje
-      if not ok then ok = pcall(CreateMacro, name, m.icon or 134400, body, nil) end -- si no cabe, general
-      if ok then made = made + 1 else skipped = skipped + 1 end
+      ops[#ops+1] = {kind="create", name=name, icon=icon, body=body}
     end
   end
-  local changed = made + updated + renamed + removed + skipped > 0
+  return ops
+end
+
+local pending, running = false, false
+local queue, count, verboseRun = {}, nil, false
+local f = CreateFrame("Frame")
+
+-- Mientras haya algo pendiente se escuchan estos eventos; si no, ninguno (nada se ejecuta en combate ni en mazmorras).
+local function SetPending()
+  pending = true
+  -- Dentro de una instancia no sirve esperar al fin de combate: solo al cambio de zona.
+  if IsInInstance() then f:UnregisterEvent("PLAYER_REGEN_ENABLED") else f:RegisterEvent("PLAYER_REGEN_ENABLED") end
+  f:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+  f:RegisterEvent("PLAYER_ENTERING_WORLD")
+end
+local function ClearPending()
+  pending = false
+  f:UnregisterEvent("PLAYER_REGEN_ENABLED")
+  f:UnregisterEvent("ZONE_CHANGED_NEW_AREA")
+  f:UnregisterEvent("PLAYER_ENTERING_WORLD")
+end
+
+local function Finish()
+  running = false
+  local c = count
+  local changed = c.made + c.updated + c.renamed + c.removed + c.skipped > 0
   if changed then
-    print(("|cffc79c6eWarriorMacroAddon|r: %d creadas, %d actualizadas, %d renombradas, %d repetidas borradas%s."):format(made, updated, renamed, removed,
-      skipped > 0 and (", |cffff5555"..skipped.." fallaron (sin hueco de macro)|r") or ""))
-  elseif verbose then
-    print("|cffc79c6eWarriorMacroAddon|r: las macros ya estan al dia, no hay nada que cambiar.")
+    print((PREFIX.."%d creadas, %d actualizadas, %d renombradas, %d repetidas borradas%s."):format(c.made, c.updated, c.renamed, c.removed,
+      c.skipped > 0 and (", |cffff5555"..c.skipped.." fallaron (sin hueco de macro)|r") or ""))
+  elseif verboseRun then
+    print(PREFIX.."las macros ya estan al dia, no hay nada que cambiar.")
   end
   local loc = GetLocale and GetLocale() or "enUS"
-  if (changed or verbose) and loc ~= "enUS" and loc ~= "enGB" and next(fallback) then
+  if (changed or verboseRun) and loc ~= "enUS" and loc ~= "enGB" and next(fallback) then
     local list = {}
     for k in pairs(fallback) do list[#list+1] = EN[k] end
     table.sort(list)
-    print("|cffc79c6eWarriorMacroAddon|r: |cffffaa00sin traduccion en este cliente:|r "..table.concat(list, ", ")
+    print(PREFIX.."|cffffaa00sin traduccion en este cliente:|r "..table.concat(list, ", ")
       ..". Si aun no tienes ese hechizo es normal; si ya lo tienes, edita la macro y escribe su nombre en espanol.")
   end
+end
+
+local function Apply(op)
+  if op.kind == "remove" then
+    local idx = GetMacroIndexByName(op.name)
+    if idx ~= 0 and pcall(DeleteMacro, idx) then count.removed = count.removed + 1 end
+  elseif op.kind == "edit" then
+    local idx = GetMacroIndexByName(op.name)
+    if idx ~= 0 and pcall(EditMacro, idx, op.name, op.icon, op.body) then count.updated = count.updated + 1 end
+  elseif op.kind == "rename" then
+    -- Renombrar conserva la macro en las barras de accion
+    local idx = GetMacroIndexByName(op.old)
+    if idx ~= 0 and pcall(EditMacro, idx, op.name, op.icon, op.body) then count.renamed = count.renamed + 1 end
+  else
+    local ok = pcall(CreateMacro, op.name, op.icon, op.body, true)   -- true = macro del personaje
+    if not ok then ok = pcall(CreateMacro, op.name, op.icon, op.body, nil) end -- si no cabe, general
+    if ok then count.made = count.made + 1 else count.skipped = count.skipped + 1 end
+  end
+end
+
+-- Una escritura por tick: cada una dispara UPDATE_MACROS y las barras (Bartender4...) se refrescan;
+-- repartirlas evita un pico de CPU en un solo frame.
+local function Step()
+  if InCombatLockdown() or IsInInstance() then
+    -- Se interrumpe; la siguiente pasada recalcula lo que falte.
+    running = false
+    wipe(queue)
+    SetPending()
+    return
+  end
+  Apply(table.remove(queue, 1))
+  if #queue > 0 then C_Timer.After(0.05, Step) else Finish() end
+end
+
+-- Devuelve true si se ha lanzado (o no habia nada que hacer), o el motivo por el que no: "combat", "instance", "busy".
+local function Run(verbose)
+  if running then return "busy" end
+  if InCombatLockdown() then SetPending() return "combat" end
+  if IsInInstance() then SetPending() return "instance" end
+  count = {made=0, updated=0, renamed=0, skipped=0, removed=0}
+  verboseRun = verbose and true or false
+  local ops = Plan(verbose)
+  if #ops == 0 then Finish() return true end
+  queue, running = ops, true
+  Step()
   return true
 end
 
-local pending = false
-local function CreateWhenSafe()
-  if not Create() then pending = true end
-end
-
-local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("PLAYER_LEVEL_UP")
-f:RegisterEvent("PLAYER_REGEN_ENABLED")
+local firstLoad = true
 f:SetScript("OnEvent", function(self, event, arg1)
-  if event == "PLAYER_ENTERING_WORLD" then
+  if event == "PLAYER_LEVEL_UP" then
+    -- 25: Opener pasa a la version con Vanguard. 30: C Ejecutar pasa a Berserker Stance.
+    if arg1 == VANGUARD_LEVEL or arg1 == BERSERKER_LEVEL then C_Timer.After(1, function() Run() end) end
+  elseif event == "PLAYER_ENTERING_WORLD" and firstLoad then
+    firstLoad = false
     self:UnregisterEvent("PLAYER_ENTERING_WORLD")
-    C_Timer.After(5, CreateWhenSafe)
-  elseif event == "PLAYER_LEVEL_UP" then
-    -- 25: Opener pasa a la version con Vanguard. 30: G Ejecutar pasa a Berserker Stance.
-    if arg1 == VANGUARD_LEVEL or arg1 == BERSERKER_LEVEL then C_Timer.After(1, CreateWhenSafe) end
-  elseif event == "PLAYER_REGEN_ENABLED" and pending then
-    pending = false
-    Create()
+    C_Timer.After(5, function() Run() end)
+  elseif pending then
+    -- Fin de combate o cambio de zona: se reintenta con un margen para no coincidir con la carga.
+    ClearPending()
+    C_Timer.After(event == "PLAYER_REGEN_ENABLED" and 1 or 5, function() Run() end)
   end
 end)
 SLASH_WARRIORMACROS1 = "/warriormacros"
 SlashCmdList.WARRIORMACROS = function()
-  if not Create(true) then print("|cffc79c6eWarriorMacroAddon|r: estas en combate; lo hare al salir.") pending = true end
+  local r = Run(true)
+  if r == "combat" then print(PREFIX.."estas en combate; lo hare al salir.")
+  elseif r == "instance" then print(PREFIX.."estas en una mazmorra o banda; lo hare al salir.")
+  elseif r == "busy" then print(PREFIX.."ya estoy actualizando las macros.") end
 end

@@ -13,6 +13,7 @@ Addon de World of Warcraft: Forever que crea y mantiene las macros del guerrero,
 - Cambia dos macros al subir de nivel:
   - **Nivel 25** (Vanguard): `P Opener` deja de pasar por Battle Stance; carga desde Defensive y en combate lanza Intercept.
   - **Nivel 30**: `C Ejecutar` pasa a usar Berserker Stance en vez de Battle Stance.
+- No toca las macros en combate ni dentro de mazmorras o bandas: lo deja pendiente y lo hace al salir. Los cambios se aplican de uno en uno, repartidos en varios frames, para no provocar picos de rendimiento.
 - Si encuentra macros con el nombre antiguo, las renombra en lugar de crear otras nuevas, así que se quedan en tus barras de acción.
 
 ## Instalación
